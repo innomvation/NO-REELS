@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center_vertical">
+
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="16sp"
+        android:layout_marginBottom="24dp"
+        android:text="접근성 권한 상태 확인 중..." />
+
+    <Button
+        android:id="@+id/openAccessibilitySettingsButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="접근성 설정 열기" />
+
+    <Switch
+        android:id="@+id/debugLogSwitch"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="디버그 로그 모드 (릴스 화면 요소 이름을 logcat에 출력)" />
+
+</LinearLayout>

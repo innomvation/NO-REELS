@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">NO REELS</string>
+    <string name="accessibility_service_description">인스타그램에서 릴스 탭/화면을 감지하면 자동으로 뒤로 이동시킵니다. DM(다이렉트 메시지)에는 영향을 주지 않습니다.</string>
+</resources>
