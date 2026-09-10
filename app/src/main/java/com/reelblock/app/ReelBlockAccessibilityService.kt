@@ -72,6 +72,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         var bestFullscreenRatio = 0f
         var playerDescMatch: MatchInfo? = null
         val screenHeight = resources.displayMetrics.heightPixels
+        val screenWidth = resources.displayMetrics.widthPixels
 
         while (queue.isNotEmpty() && visited < MAX_NODES) {
             val (node, depth) = queue.removeFirst()
@@ -118,13 +119,17 @@ class ReelBlockAccessibilityService : AccessibilityService() {
             if (isReelsPlayerDescription(desc)) {
                 val bounds = Rect()
                 val gotBounds = safe { node.getBoundsInScreen(bounds) } != null
-                val ratio = if (gotBounds && screenHeight > 0) bounds.height().toFloat() / screenHeight else 0f
+                // A node that hasn't actually been laid out/rendered can report a tall but
+                // zero-width rect (left == right) — height alone made that look "fullscreen".
+                // Require the width to also be there before trusting the height ratio.
+                val widthRatio = if (gotBounds && screenWidth > 0) bounds.width().toFloat() / screenWidth else 0f
+                val heightRatio = if (gotBounds && screenHeight > 0) bounds.height().toFloat() / screenHeight else 0f
                 if (debugLog) {
-                    Log.d(TAG, "  ^ reel-desc bounds=$bounds ratio=$ratio")
+                    Log.d(TAG, "  ^ reel-desc bounds=$bounds widthRatio=$widthRatio heightRatio=$heightRatio")
                 }
-                if (ratio > bestFullscreenRatio) {
-                    bestFullscreenRatio = ratio
-                    playerDescMatch = MatchInfo(resId, desc, className, "player-description ratio=$ratio")
+                if (widthRatio >= MIN_WIDTH_RATIO && heightRatio > bestFullscreenRatio) {
+                    bestFullscreenRatio = heightRatio
+                    playerDescMatch = MatchInfo(resId, desc, className, "player-description ratio=$heightRatio")
                 }
             }
 
@@ -184,6 +189,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         private const val MAX_DEPTH = 20
         private const val TAB_BAR_MAX_DEPTH = 3
         private const val FULLSCREEN_RATIO_THRESHOLD = 0.5f
+        private const val MIN_WIDTH_RATIO = 0.8f
 
         private val REELS_LABELS = listOf("Reels", "릴스")
         private val HOME_TAB_LABELS = listOf("홈", "Home")
