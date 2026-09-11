@@ -24,7 +24,8 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     private var lastProcessedAtMs = 0L
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        if (event.packageName != INSTAGRAM_PACKAGE) return
+        val packageName = event.packageName?.toString() ?: return
+        if (packageName !in TARGET_PACKAGES) return
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
@@ -37,11 +38,15 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         if (now - lastProcessedAtMs < PROCESS_THROTTLE_MS) return
         lastProcessedAtMs = now
 
-        val debugLog = getSharedPreferences(Prefs.NAME, MODE_PRIVATE).getBoolean(Prefs.DEBUG_LOG, false)
+        val prefs = getSharedPreferences(Prefs.NAME, MODE_PRIVATE)
+        val enabledKey = if (packageName == INSTAGRAM_PACKAGE) Prefs.BLOCK_INSTAGRAM else Prefs.BLOCK_YOUTUBE
+        if (!prefs.getBoolean(enabledKey, true)) return
+
+        val debugLog = prefs.getBoolean(Prefs.DEBUG_LOG, false)
         val root = rootInActiveWindow ?: return
 
         val match = try {
-            findReelsIndicator(root, debugLog)
+            findReelsIndicator(root, packageName, debugLog)
         } catch (e: Exception) {
             Log.d(TAG, "traversal error: ${e.message}")
             null
@@ -59,7 +64,8 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     private data class MatchInfo(val resId: String?, val desc: String?, val className: String?, val reason: String)
 
     /** BFS over the active window, capped so this stays cheap on every content-changed event. */
-    private fun findReelsIndicator(root: AccessibilityNodeInfo, debugLog: Boolean): MatchInfo? {
+    private fun findReelsIndicator(root: AccessibilityNodeInfo, packageName: String, debugLog: Boolean): MatchInfo? {
+        val isInstagram = packageName == INSTAGRAM_PACKAGE
         val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
         queue.add(root to 0)
         var visited = 0
@@ -87,49 +93,65 @@ class ReelBlockAccessibilityService : AccessibilityService() {
                 Log.d(TAG, "depth=$depth id=$resId desc=$desc selected=$selected class=$className")
             }
 
-            if (isReelsPlayerResourceId(resId)) {
-                return MatchInfo(resId, desc, className, "player-id")
-            }
-            if (selected && isReelsTabResourceId(resId)) {
-                return MatchInfo(resId, desc, className, "tab-id+selected")
-            }
-            // Instagram also sets isSelected=true on unrelated in-feed "릴스" badges
-            // deep inside the Home feed (e.g. the Reels tray). Only the actual bottom-nav
-            // tab button sits this shallow and is a FrameLayout, so require both to avoid
-            // matching those badges (which caused false triggers even on the DM screen).
-            if (selected && depth <= TAB_BAR_MAX_DEPTH && className == "android.widget.FrameLayout" && isExactReelsLabel(desc)) {
-                return MatchInfo(resId, desc, className, "tab-label+selected")
-            }
-            if (depth <= TAB_BAR_MAX_DEPTH && className == "android.widget.FrameLayout" && isHomeTabLabel(desc)) {
-                bottomNavVisible = true
-            }
-            // A reel opened from inside a DM thread plays with the chat's emoji-reaction
-            // bar still overlaid on top ("이모티콘 공감 시트 열기" etc) — that overlay only
-            // exists in a chat context, so its presence means "let them watch this one".
-            if (isDmChatMarker(desc)) {
-                dmChatOverlay = true
-            }
-            // Fullscreen Reels video surfaces (opened from the tab, Home feed, Search grid,
-            // or a profile) all carry this exact instruction text on the video node itself.
-            // Regular photo/video posts and people-search results use different phrasing.
-            // But the SAME text also shows up on reel cards embedded inline in a scrollable
-            // list (Home feed, a profile's grid/feed) — those are much smaller than the
-            // screen, while the real immersive player fills it, so measure actual bounds
-            // instead of trusting the text alone.
-            if (isReelsPlayerDescription(desc)) {
-                val bounds = Rect()
-                val gotBounds = safe { node.getBoundsInScreen(bounds) } != null
-                // A node that hasn't actually been laid out/rendered can report a tall but
-                // zero-width rect (left == right) — height alone made that look "fullscreen".
-                // Require the width to also be there before trusting the height ratio.
-                val widthRatio = if (gotBounds && screenWidth > 0) bounds.width().toFloat() / screenWidth else 0f
-                val heightRatio = if (gotBounds && screenHeight > 0) bounds.height().toFloat() / screenHeight else 0f
-                if (debugLog) {
-                    Log.d(TAG, "  ^ reel-desc bounds=$bounds widthRatio=$widthRatio heightRatio=$heightRatio")
+            if (isInstagram) {
+                if (isReelsPlayerResourceId(resId)) {
+                    return MatchInfo(resId, desc, className, "player-id")
                 }
-                if (widthRatio >= MIN_WIDTH_RATIO && heightRatio > bestFullscreenRatio) {
-                    bestFullscreenRatio = heightRatio
-                    playerDescMatch = MatchInfo(resId, desc, className, "player-description ratio=$heightRatio")
+                if (selected && isReelsTabResourceId(resId)) {
+                    return MatchInfo(resId, desc, className, "tab-id+selected")
+                }
+                // Instagram also sets isSelected=true on unrelated in-feed "릴스" badges
+                // deep inside the Home feed (e.g. the Reels tray). Only the actual bottom-nav
+                // tab button sits this shallow and is a FrameLayout, so require both to avoid
+                // matching those badges (which caused false triggers even on the DM screen).
+                if (selected && depth <= TAB_BAR_MAX_DEPTH && className == "android.widget.FrameLayout" && isExactReelsLabel(desc)) {
+                    return MatchInfo(resId, desc, className, "tab-label+selected")
+                }
+                if (depth <= TAB_BAR_MAX_DEPTH && className == "android.widget.FrameLayout" && isHomeTabLabel(desc)) {
+                    bottomNavVisible = true
+                }
+                // A reel opened from inside a DM thread plays with the chat's emoji-reaction
+                // bar still overlaid on top ("이모티콘 공감 시트 열기" etc) — that overlay only
+                // exists in a chat context, so its presence means "let them watch this one".
+                if (isDmChatMarker(desc)) {
+                    dmChatOverlay = true
+                }
+                // Fullscreen Reels video surfaces (opened from the tab, Home feed, Search grid,
+                // or a profile) all carry this exact instruction text on the video node itself.
+                // Regular photo/video posts and people-search results use different phrasing.
+                // But the SAME text also shows up on reel cards embedded inline in a scrollable
+                // list (Home feed, a profile's grid/feed) — those are much smaller than the
+                // screen, while the real immersive player fills it, so measure actual bounds
+                // instead of trusting the text alone.
+                if (isReelsPlayerDescription(desc)) {
+                    val bounds = Rect()
+                    val gotBounds = safe { node.getBoundsInScreen(bounds) } != null
+                    // A node that hasn't actually been laid out/rendered can report a tall but
+                    // zero-width rect (left == right) — height alone made that look "fullscreen".
+                    // Require the width to also be there before trusting the height ratio.
+                    val widthRatio = if (gotBounds && screenWidth > 0) bounds.width().toFloat() / screenWidth else 0f
+                    val heightRatio = if (gotBounds && screenHeight > 0) bounds.height().toFloat() / screenHeight else 0f
+                    if (debugLog) {
+                        Log.d(TAG, "  ^ reel-desc bounds=$bounds widthRatio=$widthRatio heightRatio=$heightRatio")
+                    }
+                    if (widthRatio >= MIN_WIDTH_RATIO && heightRatio > bestFullscreenRatio) {
+                        bestFullscreenRatio = heightRatio
+                        playerDescMatch = MatchInfo(resId, desc, className, "player-description ratio=$heightRatio")
+                    }
+                }
+            }
+            if (!isInstagram) {
+                // YouTube's bottom nav (홈/Shorts/만들기/구독/내 페이지) stays visible even
+                // inside the fullscreen Shorts player, unlike Instagram, so tab-selection
+                // alone isn't enough to tell "just switched tabs" apart from "still watching".
+                // But the tab click itself is still worth catching immediately.
+                if (selected && depth <= YOUTUBE_TAB_BAR_MAX_DEPTH && className == "android.widget.Button" && isExactShortsLabel(desc)) {
+                    return MatchInfo(resId, desc, className, "yt-tab-label+selected")
+                }
+                // "리믹스"(Remix) is a Shorts-only action — regular YouTube video pages don't
+                // have it, so its presence alone reliably means "currently watching a Short".
+                if (isShortsPlayerMarker(desc)) {
+                    return MatchInfo(resId, desc, className, "yt-player-marker")
                 }
             }
 
@@ -180,14 +202,27 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         return REELS_PLAYER_DESC_MARKERS.any { desc.contains(it) }
     }
 
+    private fun isExactShortsLabel(desc: String?): Boolean {
+        if (desc == null) return false
+        return desc.trim().equals("Shorts", ignoreCase = true)
+    }
+
+    private fun isShortsPlayerMarker(desc: String?): Boolean {
+        if (desc == null) return false
+        return SHORTS_PLAYER_MARKERS.any { desc.contains(it) }
+    }
+
     companion object {
         private const val TAG = "ReelBlock"
         private const val INSTAGRAM_PACKAGE = "com.instagram.android"
+        private const val YOUTUBE_PACKAGE = "com.google.android.youtube"
+        private val TARGET_PACKAGES = setOf(INSTAGRAM_PACKAGE, YOUTUBE_PACKAGE)
         private const val BLOCK_COOLDOWN_MS = 800L
         private const val PROCESS_THROTTLE_MS = 200L
         private const val MAX_NODES = 600
         private const val MAX_DEPTH = 20
         private const val TAB_BAR_MAX_DEPTH = 3
+        private const val YOUTUBE_TAB_BAR_MAX_DEPTH = 10
         private const val FULLSCREEN_RATIO_THRESHOLD = 0.5f
         private const val MIN_WIDTH_RATIO = 0.8f
 
@@ -207,5 +242,9 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         // Only present when a reel is opened from inside a DM thread (the chat's
         // emoji-reaction bar stays overlaid on the video).
         private val DM_CHAT_MARKERS = listOf("공감 시트", "이모티콘 공감")
+
+        // Shorts-exclusive actions on the fullscreen player; regular YouTube videos don't
+        // have these, so no bounds/ratio check is needed like Instagram required.
+        private val SHORTS_PLAYER_MARKERS = listOf("리믹스", "이 사운드를 사용하는 동영상 더보기")
     }
 }

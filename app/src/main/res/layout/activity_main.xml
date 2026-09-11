@@ -21,10 +21,24 @@
         android:text="접근성 설정 열기" />
 
     <Switch
+        android:id="@+id/blockInstagramSwitch"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="인스타그램 릴스 차단" />
+
+    <Switch
+        android:id="@+id/blockYoutubeSwitch"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="유튜브 Shorts 차단" />
+
+    <Switch
         android:id="@+id/debugLogSwitch"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="24dp"
-        android:text="디버그 로그 모드 (릴스 화면 요소 이름을 logcat에 출력)" />
+        android:text="디버그 로그 모드 (릴스/Shorts 화면 요소 이름을 logcat에 출력)" />
 
 </LinearLayout>
