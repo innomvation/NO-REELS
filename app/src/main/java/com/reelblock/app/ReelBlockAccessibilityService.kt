@@ -1,10 +1,20 @@
 package com.reelblock.app
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Color
+import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 
 /**
  * Phase 1: when Instagram shows the Reels tab (bottom nav) or the fullscreen
@@ -40,7 +50,10 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
         val prefs = getSharedPreferences(Prefs.NAME, MODE_PRIVATE)
         val enabledKey = if (packageName == INSTAGRAM_PACKAGE) Prefs.BLOCK_INSTAGRAM else Prefs.BLOCK_YOUTUBE
-        if (!prefs.getBoolean(enabledKey, true)) return
+        if (!prefs.getBoolean(enabledKey, true)) {
+            if (packageName == INSTAGRAM_PACKAGE) hideFeedOverlay()
+            return
+        }
 
         val debugLog = prefs.getBoolean(Prefs.DEBUG_LOG, false)
         val root = rootInActiveWindow ?: return
@@ -56,10 +69,152 @@ class ReelBlockAccessibilityService : AccessibilityService() {
             Log.d(TAG, "MATCH reason=${match.reason} id=${match.resId} desc=${match.desc} class=${match.className} -> back")
             lastBlockAtMs = now
             performGlobalAction(GLOBAL_ACTION_BACK)
+            return
+        }
+
+        if (packageName == INSTAGRAM_PACKAGE) {
+            val suggested = try { findSuggestedFeed(root, debugLog) } catch (e: Exception) { false }
+            if (suggested) showFeedOverlay() else hideFeedOverlay()
         }
     }
 
     override fun onInterrupt() {}
+
+    override fun onDestroy() {
+        hideFeedOverlay()
+        super.onDestroy()
+    }
+
+    // ---- Home feed: cover suggested/ad posts ("추천"/"광고"/unfollowed accounts) ----
+
+    private var overlayView: View? = null
+    private val handler = Handler(Looper.getMainLooper())
+
+    /**
+     * True when the Instagram Home tab is selected and a post from an account
+     * the user doesn't follow is meaningfully on screen. Suggested/ad posts carry a
+     * "추천 …"/"광고 …" description; some unfollowed posts skip that prefix but still show
+     * an "OOO님 팔로우" button in their header.
+     */
+    private fun findSuggestedFeed(root: AccessibilityNodeInfo, debugLog: Boolean): Boolean {
+        val screenHeight = resources.displayMetrics.heightPixels
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(root to 0)
+        var visited = 0
+        var homeSelected = false
+        var navTop = screenHeight
+        var suggested = false
+        val bounds = Rect()
+
+        while (queue.isNotEmpty() && visited < MAX_NODES) {
+            val (node, depth) = queue.removeFirst()
+            visited++
+            val desc = safe { node.contentDescription?.toString() }?.trim()
+            val className = safe { node.className?.toString() }
+
+            if (desc != null && depth <= TAB_BAR_MAX_DEPTH && className == "android.widget.FrameLayout" &&
+                (isHomeTabLabel(desc) || isExactReelsLabel(desc))
+            ) {
+                safe { node.getBoundsInScreen(bounds) }
+                if (bounds.top in 1 until navTop) navTop = bounds.top
+                if (isHomeTabLabel(desc) && safe { node.isSelected } == true) homeSelected = true
+            }
+
+            if (!suggested && desc != null) {
+                if (SUGGESTED_POST_PREFIXES.any { desc.startsWith(it) }) {
+                    safe { node.getBoundsInScreen(bounds) }
+                    val visible = minOf(bounds.bottom, navTop) - maxOf(bounds.top, 0)
+                    if (bounds.width() > 0 && visible >= screenHeight * SUGGESTED_VISIBLE_RATIO) suggested = true
+                } else if (desc.endsWith("님 팔로우") && depth <= FOLLOW_BUTTON_MAX_DEPTH && className == "android.widget.TextView") {
+                    // Post-header follow button; the "회원님을 위한 추천" account carousel sits deeper.
+                    safe { node.getBoundsInScreen(bounds) }
+                    if (bounds.width() > 0 && bounds.top in 0..(screenHeight * FOLLOW_BUTTON_MAX_TOP_RATIO).toInt()) suggested = true
+                }
+                if (suggested && debugLog) Log.d(TAG, "FEED suggested: depth=$depth desc=$desc bounds=$bounds")
+            }
+
+            if (depth < MAX_DEPTH) {
+                for (i in 0 until node.childCount) {
+                    safe { node.getChild(i) }?.let { queue.add(it to depth + 1) }
+                }
+            }
+        }
+        return homeSelected && suggested
+    }
+
+    private fun showFeedOverlay() {
+        if (overlayView != null) return
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val dp = resources.displayMetrics.density
+
+        val view = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.rgb(18, 18, 18))
+            addView(TextView(context).apply {
+                text = "✓\n다 봤어요"
+                textSize = 26f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+            })
+            addView(TextView(context).apply {
+                text = "팔로우한 계정 글은 여기까지예요.\n추천 게시물은 가려둘게요."
+                textSize = 15f
+                setTextColor(Color.LTGRAY)
+                gravity = Gravity.CENTER
+                setPadding(0, (12 * dp).toInt(), 0, (24 * dp).toInt())
+            })
+            addView(Button(context).apply {
+                text = "맨 위로"
+                setOnClickListener { scrollFeedToTop() }
+            })
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP }
+
+        try {
+            wm.addView(view, params)
+            overlayView = view
+            handler.postDelayed(overlayWatchdog, OVERLAY_WATCHDOG_MS)
+        } catch (e: Exception) {
+            Log.d(TAG, "overlay add failed: ${e.message}")
+        }
+    }
+
+    private fun hideFeedOverlay() {
+        val view = overlayView ?: return
+        handler.removeCallbacks(overlayWatchdog)
+        try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(view) } catch (_: Exception) {}
+        overlayView = null
+    }
+
+    /** Events only arrive for Instagram/YouTube, so poll to drop the overlay once the user leaves Instagram. */
+    private val overlayWatchdog = object : Runnable {
+        override fun run() {
+            if (overlayView == null) return
+            val pkg = safe { rootInActiveWindow?.packageName?.toString() }
+            if (pkg != INSTAGRAM_PACKAGE) {
+                hideFeedOverlay()
+            } else {
+                handler.postDelayed(this, OVERLAY_WATCHDOG_MS)
+            }
+        }
+    }
+
+    /** Re-tapping the Home tab makes Instagram scroll the feed back to the top. */
+    private fun scrollFeedToTop() {
+        hideFeedOverlay()
+        val root = rootInActiveWindow ?: return
+        val homeTabs = safe { root.findAccessibilityNodeInfosByText("홈") } ?: return
+        homeTabs.firstOrNull { safe { it.contentDescription?.toString()?.trim() } == "홈" }
+            ?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+    }
 
     private data class MatchInfo(val resId: String?, val desc: String?, val className: String?, val reason: String)
 
@@ -75,6 +230,8 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         // consider that match this flag already reflects whether the row was present.
         var bottomNavVisible = false
         var dmChatOverlay = false
+        var sawRemix = false
+        var sawShortsShare = false
         var bestFullscreenRatio = 0f
         var playerDescMatch: MatchInfo? = null
         val screenHeight = resources.displayMetrics.heightPixels
@@ -148,10 +305,17 @@ class ReelBlockAccessibilityService : AccessibilityService() {
                 if (selected && depth <= YOUTUBE_TAB_BAR_MAX_DEPTH && className == "android.widget.Button" && isExactShortsLabel(desc)) {
                     return MatchInfo(resId, desc, className, "yt-tab-label+selected")
                 }
-                // "리믹스"(Remix) is a Shorts-only action — regular YouTube video pages don't
-                // have it, so its presence alone reliably means "currently watching a Short".
+                // "리믹스" alone is NOT Shorts-only: the share sheet of a regular video also
+                // lists it (링크 복사 / Quick Share / 게시물 작성 / 리믹스). The Shorts side rail
+                // has it together with "동영상 공유", so require both; the sound button is
+                // Shorts-only by itself.
                 if (isShortsPlayerMarker(desc)) {
                     return MatchInfo(resId, desc, className, "yt-player-marker")
+                }
+                if (desc?.trim() == "리믹스") sawRemix = true
+                if (desc?.trim() == "동영상 공유") sawShortsShare = true
+                if (sawRemix && sawShortsShare) {
+                    return MatchInfo(resId, desc, className, "yt-remix+share-rail")
                 }
             }
 
@@ -226,6 +390,13 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         private const val FULLSCREEN_RATIO_THRESHOLD = 0.5f
         private const val MIN_WIDTH_RATIO = 0.8f
 
+        // Home feed suggestion cover
+        private val SUGGESTED_POST_PREFIXES = listOf("추천 ", "광고 ")
+        private const val SUGGESTED_VISIBLE_RATIO = 0.35f
+        private const val FOLLOW_BUTTON_MAX_DEPTH = 7
+        private const val FOLLOW_BUTTON_MAX_TOP_RATIO = 0.6f
+        private const val OVERLAY_WATCHDOG_MS = 500L
+
         private val REELS_LABELS = listOf("Reels", "릴스")
         private val HOME_TAB_LABELS = listOf("홈", "Home")
 
@@ -245,6 +416,6 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
         // Shorts-exclusive actions on the fullscreen player; regular YouTube videos don't
         // have these, so no bounds/ratio check is needed like Instagram required.
-        private val SHORTS_PLAYER_MARKERS = listOf("리믹스", "이 사운드를 사용하는 동영상 더보기")
+        private val SHORTS_PLAYER_MARKERS = listOf("이 사운드를 사용하는 동영상 더보기")
     }
 }
