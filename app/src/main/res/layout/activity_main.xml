@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:fillViewport="true">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
     android:orientation="vertical"
     android:padding="24dp"
     android:gravity="center_vertical">
@@ -28,11 +33,25 @@
         android:text="인스타그램 릴스 차단" />
 
     <Switch
+        android:id="@+id/igExploreHideSwitch"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="인스타 탐색 탭 피드 가리기" />
+
+    <Switch
         android:id="@+id/blockYoutubeSwitch"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
         android:text="유튜브 Shorts 차단" />
+
+    <Switch
+        android:id="@+id/ytHomeHideSwitch"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="유튜브 홈 피드 숨기기 (구독 화면으로 이동)" />
 
     <Switch
         android:id="@+id/debugLogSwitch"
@@ -42,3 +61,4 @@
         android:text="디버그 로그 모드 (릴스/Shorts 화면 요소 이름을 logcat에 출력)" />
 
 </LinearLayout>
+</ScrollView>

@@ -22,6 +22,9 @@ class MainActivity : AppCompatActivity() {
         val debugLogSwitch = findViewById<Switch>(R.id.debugLogSwitch)
 
         val prefs = getSharedPreferences(Prefs.NAME, MODE_PRIVATE)
+        // Drop data left by the removed Instagram home suggested-post limit.
+        prefs.edit().remove("feed_seen_authors").remove("feed_window_start").remove("feed_limit_enabled")
+            .remove("feed_limit_count").remove("feed_limit_window_min").apply()
 
         blockInstagramSwitch.isChecked = prefs.getBoolean(Prefs.BLOCK_INSTAGRAM, true)
         blockInstagramSwitch.setOnCheckedChangeListener { _, isChecked ->
@@ -31,6 +34,18 @@ class MainActivity : AppCompatActivity() {
         blockYoutubeSwitch.isChecked = prefs.getBoolean(Prefs.BLOCK_YOUTUBE, true)
         blockYoutubeSwitch.setOnCheckedChangeListener { _, isChecked ->
             prefs.edit().putBoolean(Prefs.BLOCK_YOUTUBE, isChecked).apply()
+        }
+
+        val igExploreHideSwitch = findViewById<Switch>(R.id.igExploreHideSwitch)
+        igExploreHideSwitch.isChecked = prefs.getBoolean(Prefs.IG_EXPLORE_HIDE_ENABLED, true)
+        igExploreHideSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(Prefs.IG_EXPLORE_HIDE_ENABLED, isChecked).apply()
+        }
+
+        val ytHomeHideSwitch = findViewById<Switch>(R.id.ytHomeHideSwitch)
+        ytHomeHideSwitch.isChecked = prefs.getBoolean(Prefs.YT_HOME_HIDE_ENABLED, true)
+        ytHomeHideSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(Prefs.YT_HOME_HIDE_ENABLED, isChecked).apply()
         }
 
         debugLogSwitch.isChecked = prefs.getBoolean(Prefs.DEBUG_LOG, false)
@@ -69,4 +84,10 @@ object Prefs {
     const val DEBUG_LOG = "debug_log"
     const val BLOCK_INSTAGRAM = "block_instagram"
     const val BLOCK_YOUTUBE = "block_youtube"
+
+    // Instagram search tab: cover the Explore grid, keep the search box (default on).
+    const val IG_EXPLORE_HIDE_ENABLED = "ig_explore_hide_enabled"
+
+    // YouTube: never show the Home feed; redirect the 홈 chip to 구독 (default on).
+    const val YT_HOME_HIDE_ENABLED = "yt_home_hide_enabled"
 }
