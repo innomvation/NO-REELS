@@ -45,6 +45,26 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         // Fast scrolling fires content-changed events dozens of times per second; a full
         // tree walk on every single one burns CPU for no benefit, so only process at most
         // a few times per second. Still fast enough to catch a Reels tap almost instantly.
+        if (now - lastProcessedAtMs < PROCESS_THROTTLE_MS) {
+            // The last event of a screen load can land here and be dropped, leaving e.g. a
+            // freshly loaded search results grid uncovered. Re-check once the window passes.
+            if (!recheckPending) {
+                recheckPending = true
+                val delay = PROCESS_THROTTLE_MS - (now - lastProcessedAtMs) + 20
+                handler.postDelayed({
+                    recheckPending = false
+                    process(packageName, System.currentTimeMillis())
+                }, delay)
+            }
+            return
+        }
+        process(packageName, now)
+    }
+
+    private var recheckPending = false
+
+    private fun process(packageName: String, now: Long) {
+        if (now - lastBlockAtMs < BLOCK_COOLDOWN_MS) return
         if (now - lastProcessedAtMs < PROCESS_THROTTLE_MS) return
         lastProcessedAtMs = now
 
@@ -57,6 +77,8 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
         val debugLog = prefs.getBoolean(Prefs.DEBUG_LOG, false)
         val root = rootInActiveWindow ?: return
+        // A delayed re-check may run after the user has already switched apps.
+        if (root.packageName?.toString() != packageName) return
 
         val match = try {
             findReelsIndicator(root, packageName, debugLog)
@@ -73,13 +95,20 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         }
 
         if (packageName == INSTAGRAM_PACKAGE) {
-            val exploreRegion = if (prefs.getBoolean(Prefs.IG_EXPLORE_HIDE_ENABLED, true)) {
+            val hideOn = prefs.getBoolean(Prefs.IG_EXPLORE_HIDE_ENABLED, true)
+            val exploreRegion = if (hideOn) {
                 try { findExploreFeedRegion(root, debugLog) } catch (e: Exception) { null }
             } else null
-            if (exploreRegion != null) {
-                showOverlay(OverlayKind.IG_EXPLORE, "explore grid on screen", exploreRegion)
-            } else {
-                hideOverlay(OverlayKind.IG_EXPLORE, "explore grid not on screen")
+            val resultsRegion = if (hideOn && exploreRegion == null) {
+                try { findSearchResultsGridRegion(root, debugLog) } catch (e: Exception) { null }
+            } else null
+            when {
+                exploreRegion != null -> showOverlay(OverlayKind.IG_EXPLORE, "explore grid on screen", exploreRegion)
+                resultsRegion != null -> showOverlay(OverlayKind.IG_SEARCH_RESULTS, "search results grid on screen", resultsRegion)
+                else -> {
+                    hideOverlay(OverlayKind.IG_EXPLORE, "explore grid not on screen")
+                    hideOverlay(OverlayKind.IG_SEARCH_RESULTS, "search results grid not on screen")
+                }
             }
         } else {
             if (!prefs.getBoolean(Prefs.YT_HOME_HIDE_ENABLED, true)) {
@@ -272,6 +301,54 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         return if (ok) Rect(0, top, screenWidth, tabBarTop) else null
     }
 
+    /**
+     * Search results screen (after typing a query): a tab row 추천/계정/오디오/태그 sits under the
+     * search box, and the 추천 tab is a Reels grid. Non-null (tab row bottom to screen bottom)
+     * when that tab row and at least one grid card below it are on screen, so the tabs stay
+     * usable and 계정/태그 (lists, no grid cards) are left alone.
+     */
+    private fun findSearchResultsGridRegion(root: AccessibilityNodeInfo, debugLog: Boolean): Rect? {
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        val bounds = Rect()
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(root to 0)
+        var visited = 0
+        var tabRowBottom = -1
+        val cardTops = ArrayList<Int>()
+        while (queue.isNotEmpty() && visited < MAX_NODES) {
+            val (node, depth) = queue.removeFirst()
+            visited++
+            val resId = safe { node.viewIdResourceName }
+            val desc = safe { node.contentDescription?.toString() }?.trim()
+            val onScreen = {
+                safe { node.isVisibleToUser } == true && safe { node.getBoundsInScreen(bounds) } != null &&
+                    bounds.width() > 0 && bounds.height() > 0 && bounds.top >= 0 && bounds.top < screenHeight
+            }
+            // Tab row: by id, or by the tab's own label ("추천, 1/4.") when ids aren't reported.
+            val isTabRow = resId?.endsWith(IG_SEARCH_RESULTS_TABS_ID_SUFFIX) == true ||
+                (desc != null && IG_SEARCH_RESULTS_TAB_REGEX.matches(desc))
+            if (isTabRow && onScreen() && bounds.top < screenHeight / 3) {
+                tabRowBottom = maxOf(tabRowBottom, bounds.bottom)
+            }
+            // The ViewPager keeps the 추천 page alive while 계정/태그 is shown, shifted off to the
+            // side, so only count cards that are horizontally on screen.
+            if (desc != null && IG_GRID_POSITION_REGEX.containsMatchIn(desc) && onScreen() &&
+                bounds.left >= 0 && bounds.right <= screenWidth
+            ) cardTops += bounds.top
+            if (depth < MAX_DEPTH) {
+                for (i in 0 until node.childCount) {
+                    safe { node.getChild(i) }?.let { queue.add(it to depth + 1) }
+                }
+            }
+        }
+        val ok = tabRowBottom >= 0 && cardTops.any { it >= tabRowBottom - 4 }
+        if (debugLog) {
+            Log.d(TAG, "IG search results: tabRowBottom=$tabRowBottom cards=${cardTops.size} visited=$visited -> cover=$ok")
+        }
+        return if (ok) Rect(0, tabRowBottom, screenWidth, screenHeight) else null
+    }
+
     // ---- Partial overlay (Instagram Explore grid / YouTube Home feed) ----
 
     private var overlayView: View? = null
@@ -293,12 +370,15 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     private enum class OverlayKind(val owner: String) {
         /** Instagram search tab landing: the Explore grid area only. */
         IG_EXPLORE(INSTAGRAM_PACKAGE),
+        /** Instagram search results 추천 tab: the Reels grid under the tab row. */
+        IG_SEARCH_RESULTS(INSTAGRAM_PACKAGE),
         /** YouTube browse screen with the 홈 chip selected: the feed area only. */
         YT_HOME(YOUTUBE_PACKAGE),
     }
 
     private fun overlayMessageFor(kind: OverlayKind): String = when (kind) {
         OverlayKind.IG_EXPLORE -> "탐색 피드는 가려 두었어요.\n위 검색창으로 찾아보세요."
+        OverlayKind.IG_SEARCH_RESULTS -> "추천 릴스는 가려 두었어요.\n위 '계정'이나 '태그' 탭을 눌러 보세요."
         OverlayKind.YT_HOME -> "유튜브 홈 피드는 가려 두었어요.\n구독 화면으로 이동할게요."
     }
 
@@ -347,6 +427,16 @@ class ReelBlockAccessibilityService : AccessibilityService() {
             overlayRegion = region?.let { Rect(it) }
             Log.d(TAG, "OVERLAY show $kind region=$region: $reason")
             handler.postDelayed(overlayWatchdog, OVERLAY_WATCHDOG_MS)
+            // Added mid-transition (e.g. keyboard closing on the search results screen), the
+            // window can stay undrawn until the app below redraws. Nudge it a few times.
+            for (delay in OVERLAY_REDRAW_DELAYS_MS) {
+                handler.postDelayed({
+                    if (overlayView === view) {
+                        view.requestLayout(); view.invalidate()
+                        try { wm.updateViewLayout(view, overlayParams(overlayRegion)) } catch (_: Exception) {}
+                    }
+                }, delay)
+            }
         } catch (e: Exception) {
             Log.d(TAG, "overlay add failed: ${e.message}")
         }
@@ -622,6 +712,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         private const val MIN_WIDTH_RATIO = 0.8f
 
         private const val OVERLAY_WATCHDOG_MS = 500L
+        private val OVERLAY_REDRAW_DELAYS_MS = longArrayOf(300L, 800L, 1500L)
 
         private const val INSTAGRAM_ID_RULES_ENABLED = false
 
@@ -645,7 +736,10 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         private const val IG_SEARCH_BOX_ID_SUFFIX = ":id/action_bar_search_edit_text"
         private val IG_SEARCH_HINT_LABELS = listOf("검색")
         // Grid cards end with their position, e.g. "…님의 릴스(2행, 3열)".
-        private val IG_GRID_POSITION_REGEX = Regex("""\(\d+행, \d+열\)$""")
+        // Instagram search results: tab row 추천/계정/오디오/태그 above the 추천 Reels grid
+        private const val IG_SEARCH_RESULTS_TABS_ID_SUFFIX = ":id/search_tab_bar_layout"
+        private val IG_SEARCH_RESULTS_TAB_REGEX = Regex("""^(추천|계정|오디오|태그), \d+/\d+\.?$""")
+        private val IG_GRID_POSITION_REGEX =Regex("""\(\d+행, \d+열\)$""")
 
         private val REELS_LABELS = listOf("Reels", "릴스")
         private val HOME_TAB_LABELS = listOf("홈", "Home")
