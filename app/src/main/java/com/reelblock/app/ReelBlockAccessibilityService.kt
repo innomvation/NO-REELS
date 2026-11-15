@@ -33,6 +33,13 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     private var lastBlockAtMs = 0L
     private var lastProcessedAtMs = 0L
 
+    // YouTube: true while the user is on the search screen or in a Shorts player opened from it.
+    // A Short tapped in search results may play; swiping on to the next one is blocked.
+    private var ytFromSearch = false
+    private var ytLeftSearchSinceMs = 0L
+    // "channel|length" of the Short opened from search; a different one means the user swiped on.
+    private var ytSearchShortKey: String? = null
+
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString() ?: return
         if (packageName !in TARGET_PACKAGES) return
@@ -515,6 +522,10 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         var sawShortsShare = false
         var shortsPlayer: MatchInfo? = null
         var subscribeButtonDesc: String? = null
+        var sawSearchQuery = false
+        var sawReelPlayer = false
+        var shortChannel: String? = null
+        var shortLength: String? = null
         var bestFullscreenRatio = 0f
         var playerDescMatch: MatchInfo? = null
         val screenHeight = resources.displayMetrics.heightPixels
@@ -615,9 +626,13 @@ class ReelBlockAccessibilityService : AccessibilityService() {
                     if (debugLog) Log.d(TAG, "  ^ shorts subscribe button bounds=$bounds onScreen=$onScreen")
                     if (onScreen) subscribeButtonDesc = desc
                 }
-                val player = shortsPlayer
-                if (player != null && subscribeButtonDesc != null) {
-                    return player.copy(reason = "${player.reason}+unsubscribed")
+                if (resId?.endsWith(YT_SEARCH_QUERY_ID_SUFFIX) == true) sawSearchQuery = true
+                if (resId?.endsWith(YT_REEL_PLAYER_ID_SUFFIX) == true) sawReelPlayer = true
+                // Which Short is on screen: its channel ("@handle 채널로 이동") and total length
+                // (seek bar "0분 26초 중 0분 4초" -> "0분 26초").
+                if (shortChannel == null && desc != null && desc.endsWith(YT_CHANNEL_BUTTON_SUFFIX)) shortChannel = desc
+                if (shortLength == null && className == "android.widget.SeekBar" && desc != null && desc.contains(" 중 ")) {
+                    shortLength = desc.substringBefore(" 중 ")
                 }
             }
 
@@ -628,6 +643,25 @@ class ReelBlockAccessibilityService : AccessibilityService() {
             }
         }
         if (!isInstagram) {
+            val inPlayer = sawReelPlayer || shortsPlayer != null
+            updateYtSearchContext(sawSearchQuery, inPlayer)
+            if (debugLog) Log.d(TAG, "yt pass search=$sawSearchQuery player=$inPlayer fromSearch=$ytFromSearch visited=$visited")
+            if (inPlayer && ytFromSearch) {
+                // Opened from search results: the tapped Short may play (even from an unsubscribed
+                // channel), but swiping on to the next one is blocked.
+                val key = if (shortChannel != null && shortLength != null) "$shortChannel|$shortLength" else null
+                if (ytSearchShortKey == null) ytSearchShortKey = key
+                if (debugLog) Log.d(TAG, "Shorts from search key=$key first=$ytSearchShortKey")
+                if (key == null || key == ytSearchShortKey) return null
+                // Back lands on the results list, whose events fall inside the block cooldown and
+                // are skipped, so forget the first Short here to let the next tapped one play.
+                ytSearchShortKey = null
+                return MatchInfo(null, key, null, "yt-search-short-swiped")
+            }
+            val player = shortsPlayer
+            if (player != null && subscribeButtonDesc != null) {
+                return player.copy(reason = "${player.reason}+unsubscribed")
+            }
             // A Short whose subscribe button hasn't loaded yet is let through for now; the
             // events that keep coming while it plays re-check it, so an unsubscribed one is
             // blocked as soon as the button appears and a subscribed one is never blocked.
@@ -640,6 +674,26 @@ class ReelBlockAccessibilityService : AccessibilityService() {
             playerDescMatch
         } else {
             null
+        }
+    }
+
+    /**
+     * Search screen -> remember it; Shorts player -> keep whatever it was; any other screen for a
+     * little while -> forget it. The grace period covers the brief transition frames between the
+     * results list and the player, which show neither.
+     */
+    private fun updateYtSearchContext(onSearchScreen: Boolean, inPlayer: Boolean) {
+        val now = System.currentTimeMillis()
+        when {
+            onSearchScreen -> { ytFromSearch = true; ytLeftSearchSinceMs = 0L; ytSearchShortKey = null }
+            inPlayer -> ytLeftSearchSinceMs = 0L
+            ytFromSearch -> {
+                if (ytLeftSearchSinceMs == 0L) ytLeftSearchSinceMs = now
+                else if (now - ytLeftSearchSinceMs > YT_SEARCH_CONTEXT_GRACE_MS) {
+                    ytFromSearch = false
+                    ytSearchShortKey = null
+                }
+            }
         }
     }
 
@@ -728,6 +782,12 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
         // Subscribe button on a Short from an unsubscribed channel: "@majubom을(를) 구독합니다."
         private val SHORTS_SUBSCRIBE_SUFFIXES = listOf("구독합니다.")
+
+        // Shorts opened from search results: allowed until the user swipes to the next one
+        private const val YT_SEARCH_QUERY_ID_SUFFIX = ":id/search_query"
+        private const val YT_REEL_PLAYER_ID_SUFFIX = ":id/reel_recycler"
+        private const val YT_CHANNEL_BUTTON_SUFFIX = " 채널로 이동"
+        private const val YT_SEARCH_CONTEXT_GRACE_MS = 1500L
 
         // Instagram search tab: Explore grid cover
         private const val IG_SEARCH_TAB_ID_SUFFIX = ":id/search_tab"
