@@ -120,6 +120,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshLockUi() {
         val dpm = getSystemService(DevicePolicyManager::class.java)
         val adminActive = dpm.isAdminActive(adminComponent())
+        if (adminActive) Lock.installBuiltInIfUnset(this)
         val hasPassword = Lock.hasPassword(this)
         val locked = Lock.isLocked(this)
         findViewById<TextView>(R.id.lockStatusText).text = buildString {

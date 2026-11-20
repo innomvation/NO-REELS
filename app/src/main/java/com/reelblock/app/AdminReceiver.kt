@@ -10,6 +10,11 @@ import android.content.Intent
  * and that screen is guarded by the accessibility service while [Lock] is locked.
  */
 class AdminReceiver : DeviceAdminReceiver() {
+    /** Allowing device admin is the point of no return: lock right away with the built-in hash. */
+    override fun onEnabled(context: Context, intent: Intent) {
+        Lock.installBuiltInIfUnset(context)
+    }
+
     override fun onDisableRequested(context: Context, intent: Intent): CharSequence =
         "NO REELS 보호가 걸려 있어요. 관리자 비밀번호로 먼저 해제하세요."
 }

@@ -1,6 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Manager password hash baked into the APK so it locks as soon as device admin is allowed.
+// Kept in lock.properties (git-ignored; the repo is public). Missing file = no built-in lock.
+val lockProps = Properties().apply {
+    val f = rootProject.file("lock.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
@@ -13,9 +22,20 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1"
+        buildConfigField("String", "LOCK_SALT", "\"${lockProps.getProperty("lock.salt", "")}\"")
+        buildConfigField("String", "LOCK_HASH", "\"${lockProps.getProperty("lock.hash", "")}\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
+        debug {
+            // Still signed with the debug key (so existing installs update in place), but not
+            // debuggable: `adb shell run-as` could otherwise rewrite the lock state in prefs.
+            isDebuggable = false
+        }
         release {
             isMinifyEnabled = false
         }

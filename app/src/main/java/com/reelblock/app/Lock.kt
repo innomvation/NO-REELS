@@ -42,6 +42,15 @@ object Lock {
         return true
     }
 
+    /**
+     * If this APK was built with a manager hash (lock.properties) and no password is set yet,
+     * installs it — which locks. Called once device admin is allowed.
+     */
+    fun installBuiltInIfUnset(context: Context): Boolean {
+        if (hasPassword(context) || BuildConfig.LOCK_HASH.isEmpty()) return false
+        return setPasswordHash(context, BuildConfig.LOCK_SALT, BuildConfig.LOCK_HASH)
+    }
+
     /** Unlocks if [password] matches. */
     fun unlock(context: Context, password: String): Boolean {
         val p = prefs(context)
