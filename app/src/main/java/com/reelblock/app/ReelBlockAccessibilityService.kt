@@ -46,6 +46,10 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString() ?: return
+        if (packageName in GUARD_PACKAGES) {
+            guardSelf(packageName)
+            return
+        }
         if (packageName !in TARGET_PACKAGES) return
         // Scrolling the home feed: move the covers along right away, outside the normal throttle.
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
@@ -152,6 +156,55 @@ class ReelBlockAccessibilityService : AccessibilityService() {
             showOverlay(OverlayKind.YT_HOME, "yt home chip selected", home.feedRegion)
             redirectToSubscriptions(home.subscriptionsChip, now)
         }
+    }
+
+    // ---- Self-protection: keep NO REELS from being switched off or uninstalled while locked ----
+    //
+    // Watches the system screens that could remove it — the app info page (삭제 / 강제 중지), the
+    // accessibility page that turns the service off, the device-admin page that deactivates it,
+    // and the uninstall confirmation — and backs out of them while the manager lock is on.
+
+    private var lastGuardAtMs = 0L
+
+    private fun guardSelf(packageName: String) {
+        if (!Lock.isLocked(this)) return
+        val now = System.currentTimeMillis()
+        if (now - lastGuardAtMs < GUARD_INTERVAL_MS) return
+        val root = rootInActiveWindow ?: return
+        val texts = try { collectTexts(root) } catch (e: Exception) { return }
+        if (getSharedPreferences(Prefs.NAME, MODE_PRIVATE).getBoolean(Prefs.DEBUG_LOG, false)) {
+            Log.d(TAG, "GUARD scan $packageName root=${root.packageName} texts=${texts.take(25)}")
+        }
+        if (texts.none { it.contains(APP_LABEL) }) return
+        val danger = when (packageName) {
+            ACCESSIBILITY_SETTINGS_PACKAGE -> GUARD_ACCESSIBILITY_WORDS
+            PACKAGE_INSTALLER_PACKAGE -> GUARD_UNINSTALL_WORDS
+            else -> GUARD_SETTINGS_WORDS
+        }
+        val hit = texts.firstOrNull { t -> danger.any { t.contains(it) } } ?: return
+        lastGuardAtMs = now
+        Log.d(TAG, "GUARD $packageName: \"$hit\" with $APP_LABEL on screen -> back")
+        performGlobalAction(GLOBAL_ACTION_BACK)
+    }
+
+    /** All visible text and content descriptions in the active window (capped). */
+    private fun collectTexts(root: AccessibilityNodeInfo): List<String> {
+        val out = mutableListOf<String>()
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(root to 0)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < MAX_NODES) {
+            val (node, depth) = queue.removeFirst()
+            visited++
+            safe { node.text?.toString() }?.takeIf { it.isNotBlank() }?.let { out.add(it) }
+            safe { node.contentDescription?.toString() }?.takeIf { it.isNotBlank() }?.let { out.add(it) }
+            if (depth < MAX_DEPTH) {
+                for (i in 0 until node.childCount) {
+                    safe { node.getChild(i) }?.let { queue.add(it to depth + 1) }
+                }
+            }
+        }
+        return out
     }
 
     override fun onInterrupt() {}
@@ -1149,6 +1202,24 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         private const val INSTAGRAM_PACKAGE = "com.instagram.android"
         private const val YOUTUBE_PACKAGE = "com.google.android.youtube"
         private val TARGET_PACKAGES = setOf(INSTAGRAM_PACKAGE, YOUTUBE_PACKAGE)
+
+        // Self-protection (see guardSelf). Package names and wording are from a Galaxy (One UI).
+        private const val APP_LABEL = "NO REELS"
+        private const val SETTINGS_PACKAGE = "com.android.settings"
+        private const val ACCESSIBILITY_SETTINGS_PACKAGE = "com.samsung.accessibility"
+        private const val PACKAGE_INSTALLER_PACKAGE = "com.google.android.packageinstaller"
+        private val GUARD_PACKAGES = setOf(SETTINGS_PACKAGE, ACCESSIBILITY_SETTINGS_PACKAGE, PACKAGE_INSTALLER_PACKAGE)
+        // App info page (삭제 / 강제 중지) and the device-admin deactivate dialog. That dialog's
+        // 취소 / 해제 buttons aren't readable, but its body ("이 관리자 앱을 사용 중이며…") is, and
+        // the activation dialog says "사용하면" instead.
+        // The accessibility pages live in com.android.settings too: the service's own detail page
+        // shows its description. Not "사용 안 함" — that's on every row of the installed-services
+        // list, and the list itself should stay usable for other services.
+        private val GUARD_SETTINGS_WORDS = listOf("강제 중지", "삭제", "제거", "관리자 앱을 사용 중", "비활성화", "릴스 탭/화면을 감지")
+        // The service's own detail page shows its description; turning it off asks "…중지할까요?".
+        private val GUARD_ACCESSIBILITY_WORDS = listOf("릴스 탭/화면을 감지", "중지", "끄기", "사용 안 함")
+        private val GUARD_UNINSTALL_WORDS = listOf("삭제", "제거")
+        private const val GUARD_INTERVAL_MS = 400L
         private const val BLOCK_COOLDOWN_MS = 800L
         private const val PROCESS_THROTTLE_MS = 200L
         private const val MAX_NODES = 600

@@ -6,4 +6,4 @@
     android:canRetrieveWindowContent="true"
     android:notificationTimeout="20"
     android:description="@string/accessibility_service_description"
-    android:packageNames="com.instagram.android,com.google.android.youtube" />
+    android:packageNames="com.instagram.android,com.google.android.youtube,com.android.settings,com.samsung.accessibility,com.google.android.packageinstaller" />

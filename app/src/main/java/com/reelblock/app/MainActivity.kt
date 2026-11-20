@@ -1,19 +1,28 @@
 package com.reelblock.app
 
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
 import android.text.TextUtils
+import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
 
+    /** Switches that turn blocking off; disabled while the manager lock is on. */
+    private lateinit var blockSwitches: List<Switch>
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        installLockHashFrom(intent)
 
         val statusText = findViewById<TextView>(R.id.statusText)
         val openSettingsButton = findViewById<Button>(R.id.openAccessibilitySettingsButton)
@@ -57,11 +66,76 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
+        blockSwitches = listOf(blockInstagramSwitch, blockYoutubeSwitch, igExploreHideSwitch, ytHomeHideSwitch)
+
+        findViewById<Button>(R.id.activateAdminButton).setOnClickListener {
+            startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent())
+                putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "활성화하면 관리자 비밀번호 없이는 NO REELS를 지울 수 없어요.")
+            })
+        }
+        val passwordInput = findViewById<EditText>(R.id.unlockPasswordInput)
+        findViewById<Button>(R.id.unlockButton).setOnClickListener {
+            val ok = Lock.unlock(this, passwordInput.text.toString())
+            passwordInput.text.clear()
+            Toast.makeText(this, if (ok) "해제됐어요. 이제 끄거나 지울 수 있어요." else "비밀번호가 틀렸어요.", Toast.LENGTH_SHORT).show()
+            refreshLockUi()
+        }
+        findViewById<Button>(R.id.relockButton).setOnClickListener {
+            Lock.relock(this)
+            refreshLockUi()
+        }
+
         statusText.text = if (isAccessibilityServiceEnabled()) {
             "접근성 서비스가 켜져 있습니다. 아래에서 켠 항목만 차단됩니다."
         } else {
             "접근성 서비스가 꺼져 있습니다. 아래 버튼을 눌러 'NO REELS'를 켜주세요."
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshLockUi()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        installLockHashFrom(intent)
+        refreshLockUi()
+    }
+
+    /**
+     * First-time setup from the PC: `am start -n com.reelblock.app/.MainActivity
+     * --es lock_salt <b64> --es lock_hash <b64>`. Ignored while locked.
+     */
+    private fun installLockHashFrom(intent: Intent?) {
+        val salt = intent?.getStringExtra(EXTRA_LOCK_SALT) ?: return
+        val hash = intent.getStringExtra(EXTRA_LOCK_HASH) ?: return
+        val ok = Lock.setPasswordHash(this, salt, hash)
+        Toast.makeText(this, if (ok) "관리자 비밀번호가 설정되고 잠겼어요." else "잠겨 있어서 비밀번호를 바꾸지 않았어요.", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun adminComponent() = ComponentName(this, AdminReceiver::class.java)
+
+    private fun refreshLockUi() {
+        val dpm = getSystemService(DevicePolicyManager::class.java)
+        val adminActive = dpm.isAdminActive(adminComponent())
+        val hasPassword = Lock.hasPassword(this)
+        val locked = Lock.isLocked(this)
+        findViewById<TextView>(R.id.lockStatusText).text = buildString {
+            append(if (adminActive) "기기 관리자: 켜짐 (삭제 방지)" else "기기 관리자: 꺼짐")
+            appendLine()
+            append(when {
+                !hasPassword -> "관리자 비밀번호: 아직 없음"
+                locked -> "보호 중: 관리자 비밀번호가 있어야 끄거나 지울 수 있어요"
+                else -> "보호 해제됨: 지금은 끄거나 지울 수 있어요"
+            })
+        }
+        findViewById<Button>(R.id.activateAdminButton).visibility = if (adminActive) View.GONE else View.VISIBLE
+        findViewById<View>(R.id.unlockPasswordInput).visibility = if (locked) View.VISIBLE else View.GONE
+        findViewById<View>(R.id.unlockButton).visibility = if (locked) View.VISIBLE else View.GONE
+        findViewById<View>(R.id.relockButton).visibility = if (hasPassword && !locked) View.VISIBLE else View.GONE
+        blockSwitches.forEach { it.isEnabled = !locked }
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
@@ -78,6 +152,9 @@ class MainActivity : AppCompatActivity() {
         while (hasNext()) yield(next())
     }
 }
+
+private const val EXTRA_LOCK_SALT = "lock_salt"
+private const val EXTRA_LOCK_HASH = "lock_hash"
 
 object Prefs {
     const val NAME = "reelblock_prefs"
