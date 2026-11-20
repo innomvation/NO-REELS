@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -93,7 +94,12 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         val enabledKey = if (packageName == INSTAGRAM_PACKAGE) Prefs.BLOCK_INSTAGRAM else Prefs.BLOCK_YOUTUBE
         if (!prefs.getBoolean(enabledKey, true)) {
             hideOverlayOf(packageName, "app switch off")
-            if (packageName == INSTAGRAM_PACKAGE) { onHomeFeed = false; hideFeedCovers() }
+            if (packageName == INSTAGRAM_PACKAGE) {
+                onHomeFeed = false
+                followingFeedOnScreen = false
+                hideFeedCovers()
+                hideFeedNavButton()
+            }
             return
         }
 
@@ -153,6 +159,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         hideOverlay(null, "service destroyed")
         hideFeedCovers()
+        hideFeedNavButton()
         super.onDestroy()
     }
 
@@ -273,6 +280,141 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         val covers = try { findFeedCovers(root, debugLog) } catch (e: Exception) { null }
         onHomeFeed = covers != null
         setFeedCovers(covers ?: emptyList())
+        updateFeedNavButton()
+    }
+
+    // ---- Instagram: floating button to hop between the home feed (stories) and the 팔로잉 feed ----
+    //
+    // The 팔로잉 feed (logo -> 팔로잉) lists every followed account's posts in time order but has no
+    // stories tray, so this button links the two: "팔로잉 피드 ▶" on home, "◀ 스토리" on 팔로잉.
+
+    private enum class FeedNavMode { HOME, FOLLOWING }
+
+    private var feedNavButton: TextView? = null
+    private var feedNavMode: FeedNavMode? = null
+    /** Set by [findFeedCovers]: the 팔로잉 feed's title bar is on screen. */
+    private var followingFeedOnScreen = false
+    /** Set by [findFeedCovers]: top of the bottom tab bar, where the floating button sits above. */
+    private var lastTabBarTop = 0
+
+    private fun updateFeedNavButton() {
+        val mode = when {
+            followingFeedOnScreen -> FeedNavMode.FOLLOWING
+            onHomeFeed -> FeedNavMode.HOME
+            else -> null
+        }
+        if (mode == null) { hideFeedNavButton(); return }
+        val existing = feedNavButton
+        if (existing != null && feedNavMode == mode) return
+        hideFeedNavButton()
+        val dp = resources.displayMetrics.density
+        val button = TextView(this).apply {
+            text = if (mode == FeedNavMode.HOME) "팔로잉 피드 ▶" else "◀ 스토리"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding((18 * dp).toInt(), 0, (18 * dp).toInt(), 0)
+            background = GradientDrawable().apply {
+                cornerRadius = 24 * dp
+                setColor(Color.argb(230, 0, 149, 246))
+            }
+            setOnClickListener { if (mode == FeedNavMode.HOME) openFollowingFeed() else backToStories() }
+        }
+        val height = (FEED_NAV_BUTTON_HEIGHT_DP * dp).toInt()
+        val tabTop = if (lastTabBarTop > 0) lastTabBarTop else resources.displayMetrics.heightPixels
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            height,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            x = (16 * dp).toInt()
+            y = tabTop - height - (16 * dp).toInt()
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) params.fitInsetsTypes = 0
+        try {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).addView(button, params)
+            feedNavButton = button
+            feedNavMode = mode
+            handler.removeCallbacks(feedCoverWatchdog)
+            handler.postDelayed(feedCoverWatchdog, OVERLAY_WATCHDOG_MS)
+        } catch (e: Exception) {
+            Log.d(TAG, "feed nav button add failed: ${e.message}")
+        }
+    }
+
+    private fun hideFeedNavButton() {
+        val view = feedNavButton ?: return
+        try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(view) } catch (_: Exception) {}
+        feedNavButton = null
+        feedNavMode = null
+    }
+
+    /** Home -> 팔로잉: tap the logo (scrolling to the top first if it slid away), then the menu's 팔로잉 item. */
+    private fun openFollowingFeed() {
+        hideFeedNavButton()
+        val root = rootInActiveWindow ?: return
+        val logo = findNodeByIdSuffix(root, IG_HOME_LOGO_ID_SUFFIX, null)
+        val logoShown = logo?.let { safe { it.isVisibleToUser } } == true
+        val delay = if (logoShown) 0L else {
+            // Re-tapping 홈 scrolls the feed up, which brings the logo back.
+            clickSelfOrAncestor(findNodeByIdSuffix(root, IG_FEED_TAB_ID_SUFFIX, null))
+            IG_SCROLL_TOP_DELAY_MS
+        }
+        handler.postDelayed({
+            val r = rootInActiveWindow ?: return@postDelayed
+            val logoClicked = clickSelfOrAncestor(findNodeByIdSuffix(r, IG_HOME_LOGO_ID_SUFFIX, null))
+            Log.d(TAG, "팔로잉 switch: tap logo result=$logoClicked")
+            handler.postDelayed({
+                val item = rootInActiveWindow?.let { findNodeByIdSuffix(it, IG_CONTEXT_MENU_ITEM_ID_SUFFIX, IG_FOLLOWING_LABEL) }
+                Log.d(TAG, "팔로잉 switch: tap menu item found=${item != null} result=${clickSelfOrAncestor(item)}")
+            }, IG_FOLLOWING_MENU_DELAY_MS)
+        }, delay)
+    }
+
+    /** 팔로잉 -> home: go back, then re-tap 홈 so the feed sits at the top with the stories tray. */
+    private fun backToStories() {
+        hideFeedNavButton()
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        handler.postDelayed({
+            val r = rootInActiveWindow ?: return@postDelayed
+            val clicked = clickSelfOrAncestor(findNodeByIdSuffix(r, IG_FEED_TAB_ID_SUFFIX, null))
+            Log.d(TAG, "스토리: back + tap 홈 result=$clicked")
+        }, IG_SCROLL_TOP_DELAY_MS)
+    }
+
+    private fun findNodeByIdSuffix(root: AccessibilityNodeInfo, idSuffix: String, desc: String?): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(root to 0)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < MAX_NODES) {
+            val (node, depth) = queue.removeFirst()
+            visited++
+            if (safe { node.viewIdResourceName }?.endsWith(idSuffix) == true &&
+                (desc == null || safe { node.contentDescription?.toString() }?.trim() == desc)
+            ) return node
+            if (depth < MAX_DEPTH) {
+                for (i in 0 until node.childCount) {
+                    safe { node.getChild(i) }?.let { queue.add(it to depth + 1) }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun clickSelfOrAncestor(node: AccessibilityNodeInfo?): Boolean {
+        var target = node
+        var hops = 0
+        while (target != null && safe { target!!.isClickable } != true && hops < 3) {
+            target = safe { target!!.parent }
+            hops++
+        }
+        return target?.let { safe { it.performAction(AccessibilityNodeInfo.ACTION_CLICK) } } == true
     }
 
     /** Null when not on the home (For You) feed; otherwise the screen rects to cover (may be empty). */
@@ -284,6 +426,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         var visited = 0
         var feedTabSelected = false
         var pushedScreen = false
+        var followingTitle = false
         var demarcatorBottom = -1
         var feedOnScreen = false
         var logoBottom = 0
@@ -313,7 +456,10 @@ class ReelBlockAccessibilityService : AccessibilityService() {
                     resId == null -> {}
                     resId.endsWith(IG_HOME_LOGO_ID_SUFFIX) -> { logoBottom = maxOf(logoBottom, bounds.bottom); feedOnScreen = true }
                     // A titled action bar means a pushed screen (팔로잉 feed, a post opened from a profile…).
-                    resId.endsWith(IG_ACTION_BAR_TITLE_ID_SUFFIX) -> pushedScreen = true
+                    resId.endsWith(IG_ACTION_BAR_TITLE_ID_SUFFIX) -> {
+                        pushedScreen = true
+                        if (desc == IG_FOLLOWING_LABEL) followingTitle = true
+                    }
                     resId.endsWith(IG_FEED_DEMARCATOR_ID_SUFFIX) -> { demarcatorBottom = bounds.bottom; feedOnScreen = true }
                     resId.endsWith(IG_POST_HEADER_ID_SUFFIX) -> { headerTops.add(bounds.top); feedOnScreen = true }
                     resId.endsWith(IG_INLINE_FOLLOW_ID_SUFFIX) -> unfollowedYs.add(bounds.centerY())
@@ -340,8 +486,14 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
         // The 홈 tab's selected state isn't always in the accessibility tree, and other tabs' screens
         // stay in the tree off screen, so "feed content actually on screen" identifies the home feed.
-        if (!(feedTabSelected || feedOnScreen) || pushedScreen) {
-            if (debugLog && headerTops.isNotEmpty()) Log.d(TAG, "IG feed covers: skip feedTab=$feedTabSelected feed=$feedOnScreen pushed=$pushedScreen")
+        followingFeedOnScreen = followingTitle
+        if (tabBarTop < screenHeight) lastTabBarTop = tabBarTop
+        // Full-screen views opened from home (story camera/editor, a story) hide the bottom tab bar;
+        // the home feed always shows it. Without this the story camera got judged as "home" and,
+        // carrying over the last post's status, was covered entirely.
+        val tabBarOnScreen = tabBarTop < screenHeight
+        if (!(feedTabSelected || feedOnScreen) || pushedScreen || !tabBarOnScreen) {
+            if (debugLog && headerTops.isNotEmpty()) Log.d(TAG, "IG feed covers: skip feedTab=$feedTabSelected feed=$feedOnScreen pushed=$pushedScreen tabBar=$tabBarOnScreen")
             return null
         }
         val limitTop = maxOf(logoBottom, trayBottom)
@@ -412,6 +564,9 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         return try {
             (getSystemService(WINDOW_SERVICE) as WindowManager).addView(view, params)
             feedCoverView = view
+            // Windows added later draw on top: drop the floating button so updateFeedNavButton()
+            // re-adds it above the covers.
+            hideFeedNavButton()
             handler.postDelayed(feedCoverWatchdog, OVERLAY_WATCHDOG_MS)
             view
         } catch (e: Exception) {
@@ -422,7 +577,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
     private fun hideFeedCovers() {
         val view = feedCoverView ?: return
-        handler.removeCallbacks(feedCoverWatchdog)
+        if (feedNavButton == null) handler.removeCallbacks(feedCoverWatchdog)
         try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(view) } catch (_: Exception) {}
         feedCoverView = null
     }
@@ -430,11 +585,13 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     /** Events only arrive for Instagram/YouTube, so poll to drop the covers once the user leaves Instagram. */
     private val feedCoverWatchdog = object : Runnable {
         override fun run() {
-            if (feedCoverView == null) return
+            if (feedCoverView == null && feedNavButton == null) return
             val pkg = safe { rootInActiveWindow?.packageName?.toString() }
             if (pkg != INSTAGRAM_PACKAGE) {
                 onHomeFeed = false
+                followingFeedOnScreen = false
                 hideFeedCovers()
+                hideFeedNavButton()
             } else {
                 handler.postDelayed(this, OVERLAY_WATCHDOG_MS)
             }
@@ -1003,6 +1160,11 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         private const val IG_FEED_TAB_ID_SUFFIX = ":id/feed_tab"
         private const val IG_TAB_ICON_ID_SUFFIX = ":id/tab_icon"
         private const val IG_ACTION_BAR_TITLE_ID_SUFFIX = ":id/action_bar_title"
+        private const val IG_FOLLOWING_LABEL = "팔로잉"
+        private const val IG_CONTEXT_MENU_ITEM_ID_SUFFIX = ":id/context_menu_item"
+        private const val IG_FOLLOWING_MENU_DELAY_MS = 600L
+        private const val IG_SCROLL_TOP_DELAY_MS = 600L
+        private const val FEED_NAV_BUTTON_HEIGHT_DP = 44
         private const val IG_FEED_DEMARCATOR_ID_SUFFIX = ":id/end_of_feed_demarcator_container"
         private const val IG_DEMARCATOR_GAP_PX = 8
         private const val IG_POST_HEADER_ID_SUFFIX = ":id/row_feed_profile_header"
