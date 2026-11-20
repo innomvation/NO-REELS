@@ -1,7 +1,10 @@
 package com.reelblock.app
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
@@ -43,6 +46,17 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString() ?: return
         if (packageName !in TARGET_PACKAGES) return
+        // Scrolling the home feed: move the covers along right away, outside the normal throttle.
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            if (packageName == INSTAGRAM_PACKAGE && onHomeFeed) {
+                val now = System.currentTimeMillis()
+                if (now - lastCoverUpdateAtMs >= FEED_COVER_SCROLL_INTERVAL_MS) {
+                    lastCoverUpdateAtMs = now
+                    rootInActiveWindow?.let { updateFeedCovers(it, false) }
+                }
+            }
+            return
+        }
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
@@ -79,6 +93,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         val enabledKey = if (packageName == INSTAGRAM_PACKAGE) Prefs.BLOCK_INSTAGRAM else Prefs.BLOCK_YOUTUBE
         if (!prefs.getBoolean(enabledKey, true)) {
             hideOverlayOf(packageName, "app switch off")
+            if (packageName == INSTAGRAM_PACKAGE) { onHomeFeed = false; hideFeedCovers() }
             return
         }
 
@@ -117,6 +132,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
                     hideOverlay(OverlayKind.IG_SEARCH_RESULTS, "search results grid not on screen")
                 }
             }
+            updateFeedCovers(root, debugLog)
         } else {
             if (!prefs.getBoolean(Prefs.YT_HOME_HIDE_ENABLED, true)) {
                 hideOverlay(OverlayKind.YT_HOME, "yt home hide off")
@@ -136,6 +152,7 @@ class ReelBlockAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         hideOverlay(null, "service destroyed")
+        hideFeedCovers()
         super.onDestroy()
     }
 
@@ -234,6 +251,219 @@ class ReelBlockAccessibilityService : AccessibilityService() {
     }
 
     // ---- Instagram search tab: hide the Explore grid, keep the search box ----
+
+    // ---- Instagram home feed: cover posts from accounts the user doesn't follow ----
+    //
+    // The feed stays scrollable (the cover window doesn't take touches); the logo bar, the stories
+    // tray and posts from followed accounts stay visible. Every post starts with a header row
+    // (row_feed_profile_header); a post is "unfollowed" when its header shows the follow button
+    // (inline_follow_button, "OOO님 팔로우") or the "회원님을 위한 추천" label, or its media is
+    // described as "추천 …"/"광고 …". Each such post is covered from its header to the next header.
+
+    private var feedCoverView: FeedCoverView? = null
+    /** True while the last check found the home feed, so scroll events refresh the covers quickly. */
+    private var onHomeFeed = false
+    private var lastCoverUpdateAtMs = 0L
+    /** Status of the first visible post last time; it becomes the top post once its header scrolls off. */
+    private var lastFirstPostUnfollowed = false
+    /** author -> unfollowed, learned from headers, to judge a post whose header is off screen by its media. */
+    private val authorUnfollowed = HashMap<String, Boolean>()
+
+    private fun updateFeedCovers(root: AccessibilityNodeInfo, debugLog: Boolean) {
+        val covers = try { findFeedCovers(root, debugLog) } catch (e: Exception) { null }
+        onHomeFeed = covers != null
+        setFeedCovers(covers ?: emptyList())
+    }
+
+    /** Null when not on the home (For You) feed; otherwise the screen rects to cover (may be empty). */
+    private fun findFeedCovers(root: AccessibilityNodeInfo, debugLog: Boolean): List<Rect>? {
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(root to 0)
+        var visited = 0
+        var feedTabSelected = false
+        var pushedScreen = false
+        var demarcatorBottom = -1
+        var feedOnScreen = false
+        var logoBottom = 0
+        var trayBottom = 0
+        var tabBarTop = screenHeight
+        val headerTops = mutableListOf<Int>()
+        val unfollowedYs = mutableListOf<Int>()
+        val authorYs = mutableListOf<Pair<Int, String>>()   // header author names
+        val mediaAuthorYs = mutableListOf<Pair<Int, String>>() // "X님의 사진 …" media descriptions
+        val bounds = Rect()
+
+        while (queue.isNotEmpty() && visited < MAX_NODES) {
+            val (node, depth) = queue.removeFirst()
+            visited++
+            val resId = safe { node.viewIdResourceName }
+            val desc = safe { node.contentDescription?.toString() }?.trim()
+            // Instagram keeps nodes for scrolled-away content in the tree with bogus rects.
+            val onScreen = safe { node.isVisibleToUser } == true && safe { node.getBoundsInScreen(bounds) } != null &&
+                bounds.width() > 0 && bounds.height() > 0
+            // The selected state sits on the 홈 tab itself on some builds, on its tab_icon child on others.
+            if (safe { node.isSelected } == true && (resId?.endsWith(IG_FEED_TAB_ID_SUFFIX) == true ||
+                    (resId?.endsWith(IG_TAB_ICON_ID_SUFFIX) == true &&
+                        safe { node.parent?.viewIdResourceName }?.endsWith(IG_FEED_TAB_ID_SUFFIX) == true))
+            ) feedTabSelected = true
+            if (onScreen) {
+                when {
+                    resId == null -> {}
+                    resId.endsWith(IG_HOME_LOGO_ID_SUFFIX) -> { logoBottom = maxOf(logoBottom, bounds.bottom); feedOnScreen = true }
+                    // A titled action bar means a pushed screen (팔로잉 feed, a post opened from a profile…).
+                    resId.endsWith(IG_ACTION_BAR_TITLE_ID_SUFFIX) -> pushedScreen = true
+                    resId.endsWith(IG_FEED_DEMARCATOR_ID_SUFFIX) -> { demarcatorBottom = bounds.bottom; feedOnScreen = true }
+                    resId.endsWith(IG_POST_HEADER_ID_SUFFIX) -> { headerTops.add(bounds.top); feedOnScreen = true }
+                    resId.endsWith(IG_INLINE_FOLLOW_ID_SUFFIX) -> unfollowedYs.add(bounds.centerY())
+                    resId.endsWith(IG_SUGGESTED_LABEL_ID_SUFFIX) && desc?.contains("추천") == true -> unfollowedYs.add(bounds.centerY())
+                    resId.endsWith(IG_POST_AUTHOR_ID_SUFFIX) && desc != null -> authorYs.add(bounds.centerY() to desc)
+                    IG_TAB_ID_SUFFIXES.any { resId.endsWith(it) } && bounds.top > screenHeight / 2 ->
+                        tabBarTop = minOf(tabBarTop, bounds.top)
+                }
+                if (desc == IG_STORIES_TRAY_DESC) { trayBottom = maxOf(trayBottom, bounds.bottom); feedOnScreen = true }
+                if (desc != null) {
+                    if (IG_SUGGESTED_MEDIA_PREFIXES.any { desc.startsWith(it) }) {
+                        unfollowedYs.add(bounds.top + 1)
+                    } else if (desc.contains("님의 ")) {
+                        mediaAuthorYs.add(bounds.top + 1 to desc.substringBefore("님의 ").trim())
+                    }
+                }
+            }
+            if (depth < MAX_DEPTH) {
+                for (i in 0 until node.childCount) {
+                    safe { node.getChild(i) }?.let { queue.add(it to depth + 1) }
+                }
+            }
+        }
+
+        // The 홈 tab's selected state isn't always in the accessibility tree, and other tabs' screens
+        // stay in the tree off screen, so "feed content actually on screen" identifies the home feed.
+        if (!(feedTabSelected || feedOnScreen) || pushedScreen) {
+            if (debugLog && headerTops.isNotEmpty()) Log.d(TAG, "IG feed covers: skip feedTab=$feedTabSelected feed=$feedOnScreen pushed=$pushedScreen")
+            return null
+        }
+        val limitTop = maxOf(logoBottom, trayBottom)
+        val limitBottom = tabBarTop
+        val tops = headerTops.distinct().sorted()
+        val covers = mutableListOf<Rect>()
+
+        // Segment above the first visible header: the tail of a post whose header scrolled off.
+        val firstTop = tops.firstOrNull() ?: limitBottom
+        if (firstTop > limitTop) {
+            val inTop = { y: Int -> y in limitTop until firstTop }
+            val topUnfollowed = when {
+                // The "모두 확인했습니다" divider sits right above the first suggestion — not a post.
+                demarcatorBottom > limitTop && demarcatorBottom >= firstTop - IG_DEMARCATOR_GAP_PX -> false
+                unfollowedYs.any(inTop) -> true
+                else -> mediaAuthorYs.firstOrNull { inTop(it.first) }?.let { authorUnfollowed[it.second] }
+                    ?: lastFirstPostUnfollowed
+            }
+            if (topUnfollowed) covers.add(Rect(0, limitTop, screenWidth, firstTop))
+        }
+
+        // One segment per visible header, down to the next header (or the tab bar).
+        tops.forEachIndexed { i, top ->
+            val bottom = tops.getOrNull(i + 1) ?: limitBottom
+            val inSeg = { y: Int -> y in top until bottom }
+            val unfollowed = unfollowedYs.any(inSeg)
+            authorYs.firstOrNull { inSeg(it.first) }?.let { authorUnfollowed[it.second] = unfollowed }
+            if (i == 0) lastFirstPostUnfollowed = unfollowed
+            val coverTop = maxOf(top, limitTop)
+            val coverBottom = minOf(bottom, limitBottom)
+            if (unfollowed && coverBottom > coverTop) covers.add(Rect(0, coverTop, screenWidth, coverBottom))
+        }
+
+        if (debugLog) {
+            Log.d(TAG, "IG feed covers: limit=$limitTop..$limitBottom headers=$tops unfollowedYs=$unfollowedYs " +
+                "visited=$visited -> $covers")
+        }
+        return covers
+    }
+
+    private fun setFeedCovers(rects: List<Rect>) {
+        if (rects.isEmpty()) {
+            hideFeedCovers()
+            return
+        }
+        val view = feedCoverView ?: createFeedCoverView() ?: return
+        if (view.rects != rects) {
+            view.rects = rects
+            view.invalidate()
+        }
+    }
+
+    private fun createFeedCoverView(): FeedCoverView? {
+        val view = FeedCoverView(this)
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            // Touches go straight through so the feed scrolls normally under the covers.
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) params.fitInsetsTypes = 0
+        return try {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).addView(view, params)
+            feedCoverView = view
+            handler.postDelayed(feedCoverWatchdog, OVERLAY_WATCHDOG_MS)
+            view
+        } catch (e: Exception) {
+            Log.d(TAG, "feed cover add failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun hideFeedCovers() {
+        val view = feedCoverView ?: return
+        handler.removeCallbacks(feedCoverWatchdog)
+        try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(view) } catch (_: Exception) {}
+        feedCoverView = null
+    }
+
+    /** Events only arrive for Instagram/YouTube, so poll to drop the covers once the user leaves Instagram. */
+    private val feedCoverWatchdog = object : Runnable {
+        override fun run() {
+            if (feedCoverView == null) return
+            val pkg = safe { rootInActiveWindow?.packageName?.toString() }
+            if (pkg != INSTAGRAM_PACKAGE) {
+                onHomeFeed = false
+                hideFeedCovers()
+            } else {
+                handler.postDelayed(this, OVERLAY_WATCHDOG_MS)
+            }
+        }
+    }
+
+    /** Full-screen, touch-transparent view that paints the given screen rects. */
+    private class FeedCoverView(context: Context) : View(context) {
+        var rects: List<Rect> = emptyList()
+        private val fill = Paint().apply { color = Color.rgb(18, 18, 18) }
+        private val label = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.GRAY
+            textAlign = Paint.Align.CENTER
+            textSize = 15 * context.resources.displayMetrics.density
+        }
+        private val location = IntArray(2)
+
+        override fun onDraw(canvas: Canvas) {
+            // Rects are absolute screen coordinates; shift by wherever the window actually landed.
+            getLocationOnScreen(location)
+            canvas.translate(-location[0].toFloat(), -location[1].toFloat())
+            for (r in rects) {
+                canvas.drawRect(r, fill)
+                if (r.height() > label.textSize * 3) {
+                    canvas.drawText("추천 게시물 숨김", r.exactCenterX(), r.exactCenterY(), label)
+                }
+            }
+        }
+    }
 
     /**
      * Non-null (the region between the search box and the bottom tab bar) when the search tab
@@ -602,7 +832,11 @@ class ReelBlockAccessibilityService : AccessibilityService() {
                 // inside the fullscreen Shorts player, unlike Instagram, so tab-selection
                 // alone isn't enough to tell "just switched tabs" apart from "still watching".
                 // But the tab click itself is still worth catching immediately.
-                if (selected && depth <= YOUTUBE_TAB_BAR_MAX_DEPTH && className == "android.widget.Button" && isExactShortsLabel(desc)) {
+                // A channel page has its own 홈/동영상/Shorts tab row (id tabs_bar_text_tab_view);
+                // its "Shorts" tab is the channel's Shorts list, not the bottom-nav Shorts feed.
+                if (selected && depth <= YOUTUBE_TAB_BAR_MAX_DEPTH && className == "android.widget.Button" && isExactShortsLabel(desc) &&
+                    resId?.contains("tabs_bar_text_tab_view") != true
+                ) {
                     return MatchInfo(resId, desc, className, "yt-tab-label+selected")
                 }
                 // "리믹스" alone is NOT Shorts-only: the share sheet of a regular video also
@@ -761,6 +995,23 @@ class ReelBlockAccessibilityService : AccessibilityService() {
         private const val BLOCK_COOLDOWN_MS = 800L
         private const val PROCESS_THROTTLE_MS = 200L
         private const val MAX_NODES = 600
+
+        // Instagram home feed cover
+        private const val IG_HOME_LOGO_ID_SUFFIX = ":id/title_logo"
+        private const val IG_STORIES_TRAY_DESC = "릴스 트레이 컨테이너"
+        // Home feed: cover posts from accounts the user doesn't follow
+        private const val IG_FEED_TAB_ID_SUFFIX = ":id/feed_tab"
+        private const val IG_TAB_ICON_ID_SUFFIX = ":id/tab_icon"
+        private const val IG_ACTION_BAR_TITLE_ID_SUFFIX = ":id/action_bar_title"
+        private const val IG_FEED_DEMARCATOR_ID_SUFFIX = ":id/end_of_feed_demarcator_container"
+        private const val IG_DEMARCATOR_GAP_PX = 8
+        private const val IG_POST_HEADER_ID_SUFFIX = ":id/row_feed_profile_header"
+        private const val IG_POST_AUTHOR_ID_SUFFIX = ":id/row_feed_photo_profile_name"
+        private const val IG_INLINE_FOLLOW_ID_SUFFIX = ":id/inline_follow_button"
+        private const val IG_SUGGESTED_LABEL_ID_SUFFIX = ":id/secondary_label"
+        private val IG_SUGGESTED_MEDIA_PREFIXES = listOf("추천 ", "광고 ")
+        private const val FEED_COVER_SCROLL_INTERVAL_MS = 30L
+        private val IG_TAB_ID_SUFFIXES = listOf(":id/feed_tab", ":id/clips_tab", ":id/direct_tab", ":id/search_tab", ":id/profile_tab")
         private const val MAX_DEPTH = 20
         private const val TAB_BAR_MAX_DEPTH = 3
         private const val YOUTUBE_TAB_BAR_MAX_DEPTH = 10
