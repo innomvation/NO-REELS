@@ -203,7 +203,9 @@ class ReelBlockAccessibilityService : AccessibilityService() {
             }
         }
 
-        val isHome = homeChipSelected == true && homeChipVisible
+        // A channel page has the same tab row (홈 / 동영상 / Shorts …) with its 홈 tab selected on entry,
+        // but no 구독 chip — only the browse screen's chip row has one.
+        val isHome = homeChipSelected == true && homeChipVisible && subscriptionsChip != null
         if (debugLog) {
             Log.d(TAG, "YT chips: home=$homeChipSelected visible=$homeChipVisible selected=$selectedChip " +
                 "subsFound=${subscriptionsChip != null} rowBottom=$chipRowBottom navTop=$navTop visited=$visited -> home=$isHome")
